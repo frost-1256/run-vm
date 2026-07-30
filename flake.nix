@@ -41,7 +41,7 @@
 
       nixosModules.default = self.nixosModules.run-vm;
       nixosModules.run-vm = { pkgs, ... }: {
-        environment.systemPackages = [ self.packages.${pkgs.system}.run-vm ];
+        environment.systemPackages = [ self.packages.${pkgs.stdenv.hostPlatform.system}.run-vm ];
       };
 
       overlays.default = final: prev: {
