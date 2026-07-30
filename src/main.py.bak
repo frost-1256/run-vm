@@ -4,6 +4,8 @@ import curses
 import subprocess
 import shlex
 import time
+import sys
+import os
 
 
 def run_virsh(args):
@@ -36,7 +38,7 @@ def run_tool(tool, args, pkgs=None, timeout=60):
                 return result.stdout + result.stderr, result.returncode
             except Exception as e:
                 return f"Error: {e}", -1
-        return f"{tool} not found.", -1
+        return f"tool not found", -1
     except Exception as e:
         return f"Error: {e}", -1
 
@@ -44,7 +46,7 @@ def run_tool(tool, args, pkgs=None, timeout=60):
 def get_vms():
     out, rc = run_virsh(["list", "--all"])
     if rc != 0:
-        return [], out.strip() or f"virsh list failed (exit {rc})"
+        return []
     vms = []
     lines = out.strip().split("\n")
     found_sep = False
@@ -61,17 +63,41 @@ def get_vms():
         vid = parts[0]
         rest = parts[1]
 
-        for suffix in STATE_SUFFIXES:
-            if rest.endswith(suffix):
-                name = rest[: -len(suffix)].rstrip()
-                state = suffix
-                break
+        if rest.endswith("shut off"):
+            name = rest[: -len("shut off")].rstrip()
+            state = "shut off"
+        elif rest.endswith("in shutdown"):
+            name = rest[: -len("in shutdown")].rstrip()
+            state = "in shutdown"
+        elif rest.endswith("running"):
+            name = rest[: -len("running")].rstrip()
+            state = "running"
+        elif rest.endswith("paused"):
+            name = rest[: -len("paused")].rstrip()
+            state = "paused"
+        elif rest.endswith("crashed"):
+            name = rest[: -len("crashed")].rstrip()
+            state = "crashed"
+        elif rest.endswith("dying"):
+            name = rest[: -len("dying")].rstrip()
+            state = "dying"
+        elif rest.endswith("pmsuspended"):
+            name = rest[: -len("pmsuspended")].rstrip()
+            state = "pmsuspended"
         else:
             name = rest
             state = "unknown"
 
         vms.append({"id": vid, "name": name, "state": state})
-    return vms, None
+    return vms
+
+
+def get_vm_info(name):
+    out, rc = run_virsh(["dominfo", name])
+    if rc != 0:
+        out2, _ = run_virsh(["domstate", name])
+        return f"Error getting info for {name}\n{out}{out2}"
+    return out
 
 
 def get_display_uri(name):
@@ -106,16 +132,6 @@ def vm_action(name, action):
     return out, rc
 
 
-STATE_SUFFIXES = [
-    "shut off",
-    "in shutdown",
-    "running",
-    "paused",
-    "crashed",
-    "dying",
-    "pmsuspended",
-]
-
 STATE_COLORS = {
     "running": 1,
     "shut off": 2,
@@ -128,6 +144,10 @@ STATE_COLORS = {
 }
 
 
+def quote_args(args):
+    return " ".join(shlex.quote(a) for a in args)
+
+
 class VirshTUI:
     def __init__(self, stdscr):
         self.stdscr = stdscr
@@ -137,6 +157,7 @@ class VirshTUI:
         self.log_lines = []
         self.status_msg = ""
         self.running = True
+        self.last_refresh = 0
 
         curses.curs_set(0)
         curses.use_default_colors()
@@ -161,7 +182,7 @@ class VirshTUI:
 
     def get_list_rect(self, height, width):
         list_top = 1
-        list_height = height - 14
+        list_height = height - 11
         return list_top, list_height
 
     def draw_list(self, height, width):
@@ -208,7 +229,7 @@ class VirshTUI:
                 self.stdscr.attroff(color)
 
     def draw_info(self, height, width):
-        info_y = height - 13
+        info_y = height - 10
         try:
             self.stdscr.addstr(info_y - 1, 0, "─" * width)
         except curses.error:
@@ -229,7 +250,7 @@ class VirshTUI:
                 pass
 
     def draw_logs(self, height, width):
-        log_y = height - 9
+        log_y = height - 6
         try:
             self.stdscr.addstr(log_y - 1, 0, "─" * width)
         except curses.error:
@@ -240,7 +261,7 @@ class VirshTUI:
             self.stdscr.attroff(curses.A_DIM)
         except curses.error:
             pass
-        max_logs = 8
+        max_logs = 5
         lines = self.log_lines[-max_logs:]
         for i, line in enumerate(lines):
             try:
@@ -270,9 +291,9 @@ class VirshTUI:
     def draw(self):
         self.stdscr.nodelay(False)
         height, width = self.stdscr.getmaxyx()
-        if height < 19 or width < 50:
+        if height < 16 or width < 50:
             self.stdscr.clear()
-            self.stdscr.addstr(0, 0, f"Terminal too small ({height}x{width}). Need at least 50x19.")
+            self.stdscr.addstr(0, 0, f"Terminal too small ({height}x{width}). Need at least 50x12.")
             self.stdscr.refresh()
             return
         curses.curs_set(0)
@@ -330,19 +351,26 @@ class VirshTUI:
                 selected = (selected - 1) % 2
             elif key in (10, 13, curses.KEY_ENTER, ord(" ")):
                 self.clear_rect(dialog_y, dialog_x, dialog_h, dialog_w)
-                self.stdscr.refresh()
                 return selected == 0
             elif key == 27:
                 self.clear_rect(dialog_y, dialog_x, dialog_h, dialog_w)
-                self.stdscr.refresh()
                 return False
 
-    def _run_list_menu(self, title, items):
-        """項目を縦に並べて選ばせる汎用メニュー。
-        ↑/↓・j/kで移動、Enter/Spaceで決定（選択項目を'force-off'のような
-        スラッグ形式で返す）、Esc/q/cでキャンセル('cancel'を返す)。
-        show_menu / edit_vm_menu の共通処理。"""
+    def show_menu(self, vm):
         height, width = self.stdscr.getmaxyx()
+        state = vm["state"]
+
+        items = []
+        if state == "running":
+            items = ["Shutdown", "Force Off", "Reboot", "Suspend", "Console", "VNC Info", "Info"]
+        elif state == "paused":
+            items = ["Resume", "Force Off", "Console", "VNC Info", "Info"]
+        elif state == "shut off":
+            items = ["Start", "Info"]
+        else:
+            items = ["Info"]
+        items += ["Edit", "Delete", "Cancel"]
+
         menu_w = 26
         menu_h = len(items) + 2
         menu_y = max(1, (height - menu_h) // 2)
@@ -365,7 +393,8 @@ class VirshTUI:
             try:
                 self.stdscr.attron(curses.A_REVERSE)
                 self.stdscr.addstr(menu_y, menu_x, " " * menu_w)
-                self.stdscr.addstr(menu_y, menu_x, title[:menu_w])
+                title = f" {vm['name'][:menu_w-4]} "
+                self.stdscr.addstr(menu_y, menu_x, title)
                 self.stdscr.attroff(curses.A_REVERSE)
                 self.stdscr.addstr(menu_y + menu_h - 1, menu_x, " " * menu_w)
             except curses.error:
@@ -379,68 +408,25 @@ class VirshTUI:
                 selected = (selected - 1) % len(items)
             elif key in (10, 13, curses.KEY_ENTER, ord(" ")):
                 self.clear_rect(menu_y, menu_x, menu_h, menu_w)
-                self.stdscr.refresh()
                 return items[selected].lower().replace(" ", "-")
             elif key in (27, ord("q"), ord("Q"), ord("c")):
                 self.clear_rect(menu_y, menu_x, menu_h, menu_w)
-                self.stdscr.refresh()
                 return "cancel"
 
-    def show_menu(self, vm):
-        state = vm["state"]
-
-        if state == "running":
-            items = ["Shutdown", "Force Off", "Reboot", "Suspend", "Console", "VNC Info", "Info"]
-        elif state == "paused":
-            items = ["Resume", "Force Off", "Console", "VNC Info", "Info"]
-        elif state == "shut off":
-            items = ["Start", "Info"]
-        else:
-            items = ["Info"]
-        items += ["Edit", "Delete", "Cancel"]
-
-        title = f" {vm['name'][:22]} "
-        return self._run_list_menu(title, items)
-
-    def refresh_vms(self, quiet=False):
-        self.vms, err = get_vms()
+    def refresh_vms(self):
+        self.vms = get_vms()
         if self.vms:
             self.selected = min(self.selected, len(self.vms) - 1)
         else:
             self.selected = 0
-            if not quiet:
-                if err:
-                    self.info_lines = ["Failed to get VM list:"] + err.split("\n")[:5]
-                else:
-                    self.info_lines = ["No VMs found."]
-        if not quiet:
-            if err:
-                self.status_msg = f"virsh error: {err.split(chr(10))[0][:60]}"
-            else:
-                self.status_msg = f"Refreshed: {len(self.vms)} VM(s)"
-        self.add_log(
-            f"Refreshed VM list: {len(self.vms)} VMs"
-            if not err else f"Refresh failed: {err.split(chr(10))[0][:80]}"
-        )
+            self.info_lines = ["No VMs found."]
+        self.status_msg = f"Refreshed: {len(self.vms)} VM(s)"
+        self.add_log(f"Refreshed VM list: {len(self.vms)} VMs")
 
     def update_info(self, vm):
         out, _ = run_virsh(["dominfo", vm["name"]])
         self.info_lines = out.strip().split("\n") if out.strip() else ["(no info)"]
         self.add_log(f"Info: {vm['name']}")
-
-    def do_quick_action(self, vm, action, label):
-        """start/shutdown/force-off/reboot等の単純なvirshアクションを実行し、
-        結果表示・ログ記録・リスト更新までまとめて行う共通処理。"""
-        out, rc = vm_action(vm["name"], action)
-        ok = rc == 0
-        self.status_msg = f"{label}: {vm['name']} - {'OK' if ok else 'FAILED'}"
-        if not ok and out.strip():
-            self.info_lines = out.strip().split("\n")[:5]
-        self.add_log(self.status_msg)
-        time.sleep(0.5)
-        self.refresh_vms(quiet=True)
-        if self.vms and self.selected < len(self.vms):
-            self.update_info(self.vms[self.selected])
 
     def show_display_info(self, vm):
         state = vm["state"]
@@ -452,7 +438,7 @@ class VirshTUI:
             else:
                 lines.append("Display: not available (no VNC/SPICE graphics)")
             ip = get_network_info(vm["name"])
-            lines.append("Network:")
+            lines.append(f"Network:")
             for l in ip.split("\n"):
                 lines.append(f"  {l}")
         self.info_lines = lines
@@ -471,7 +457,7 @@ class VirshTUI:
                 ["nix-shell", "-p", "libvirt", "--run", f"virsh console {shlex.quote(name)}"]
             )
         except Exception as e:
-            self.add_log(f"Console error: {e}")
+            pass
         curses.reset_prog_mode()
         curses.doupdate()
         self.status_msg = f"Console session ended"
@@ -499,7 +485,6 @@ class VirshTUI:
         total_elems = n_flds + 2
 
         values = [f[1] for f in fields]
-        cursors = [len(v) for v in values]
         focus = 0
         editing = False
 
@@ -515,13 +500,11 @@ class VirshTUI:
 
             label_w = 14
             val_w = form_w - label_w - 5
-            offsets = [0] * n_flds
 
             for i in range(n_flds):
                 y = form_y + 2 + i
                 label = fields[i][0]
                 val = values[i]
-                pos = cursors[i]
 
                 self.stdscr.attron(curses.A_BOLD)
                 try:
@@ -530,20 +513,7 @@ class VirshTUI:
                     pass
                 self.stdscr.attroff(curses.A_BOLD)
 
-                if len(val) <= val_w:
-                    disp = val
-                    offset = 0
-                else:
-                    half = val_w // 2
-                    if pos <= half:
-                        offset = 0
-                    elif pos >= len(val) - half:
-                        offset = len(val) - val_w
-                    else:
-                        offset = pos - half
-                    disp = val[offset:offset + val_w]
-
-                offsets[i] = offset
+                disp = val[:val_w]
                 pad = " " * (val_w - len(disp))
 
                 if i == focus and editing:
@@ -567,6 +537,7 @@ class VirshTUI:
                         pass
 
             btn_y = form_y + 2 + n_flds + 1
+
             if focus == n_flds:
                 self.stdscr.attron(curses.color_pair(10) | curses.A_REVERSE)
             else:
@@ -595,7 +566,7 @@ class VirshTUI:
 
             help_y = btn_y + 2
             if editing:
-                hint = " [editing] ←/→: move  Enter: confirm  Esc: cancel  Tab/↑↓: next "
+                hint = " [editing] Enter: confirm  Esc: cancel edit  Tab/arrows: confirm & move "
             else:
                 hint = " Tab/arrows: move  Enter: edit field / press button  Esc: cancel "
             try:
@@ -603,20 +574,12 @@ class VirshTUI:
             except curses.error:
                 pass
 
-            # ★★★ ここが修正ポイント ★★★
             if editing and focus < n_flds:
-                focus_pos = cursors[focus]
-                focus_offset = offsets[focus]
-                cursor_display = focus_pos - focus_offset
-                cx = form_x + 3 + label_w + cursor_display
+                cx = form_x + 3 + label_w + len(values[focus][:val_w])
                 cy = form_y + 2 + focus
-                cx = max(form_x + 2, min(cx, form_x + form_w - 2))
-                cy = max(form_y + 2, min(cy, form_y + 2 + n_flds - 1))
                 try:
                     self.stdscr.move(cy, cx)
-                    # カーソルをリセットしてから表示（確実性を高める）
-                    curses.curs_set(0)
-                    curses.curs_set(1)   # それでもダメなら 2 に変更
+                    curses.curs_set(1)
                 except curses.error:
                     pass
             else:
@@ -627,9 +590,6 @@ class VirshTUI:
             key = self.stdscr.getch()
 
             if editing and focus < n_flds:
-                val = values[focus]
-                pos = cursors[focus]
-
                 if key in (10, 13, curses.KEY_ENTER):
                     editing = False
                     focus = (focus + 1) % total_elems
@@ -641,24 +601,14 @@ class VirshTUI:
                 elif key in (curses.KEY_UP, curses.KEY_BTAB):
                     editing = False
                     focus = (focus - 1) % total_elems
-                elif key == curses.KEY_LEFT:
-                    if pos > 0:
-                        cursors[focus] = pos - 1
-                elif key == curses.KEY_RIGHT:
-                    if pos < len(val):
-                        cursors[focus] = pos + 1
                 elif key == curses.KEY_BACKSPACE or key == 127:
-                    if pos > 0:
-                        new_val = val[:pos-1] + val[pos:]
-                        values[focus] = new_val
-                        cursors[focus] = pos - 1
+                    if values[focus]:
+                        values[focus] = values[focus][:-1]
                 elif 32 <= key <= 126:
                     ch = chr(key)
                     is_num = fields[focus][2] == "num"
-                    if (not is_num or ch.isdigit()) and len(val) < 100:
-                        new_val = val[:pos] + ch + val[pos:]
-                        values[focus] = new_val
-                        cursors[focus] = pos + 1
+                    if (not is_num or ch.isdigit()) and len(values[focus]) < val_w:
+                        values[focus] += ch
             else:
                 if key in (ord("j"), curses.KEY_DOWN, ord("\t")):
                     focus = (focus + 1) % total_elems
@@ -667,18 +617,14 @@ class VirshTUI:
                 elif key in (10, 13, curses.KEY_ENTER, ord(" ")):
                     if focus == n_flds:
                         self.stdscr.clear()
-                        curses.curs_set(0)
                         return values
                     elif focus == n_flds + 1:
                         self.stdscr.clear()
-                        curses.curs_set(0)
                         return None
                     else:
                         editing = True
-                        cursors[focus] = len(values[focus])
                 elif key == 27:
                     self.stdscr.clear()
-                    curses.curs_set(0)
                     return None
 
     def do_create_vm(self, values):
@@ -709,7 +655,7 @@ class VirshTUI:
             "--network", network,
             "--graphics", gfx,
             "--noautoconsole",
-            "--osinfo", "detect=on,require=off",
+            "--os-variant", "detect=on,require=off",
         ]
         if iso_path:
             args += ["--cdrom", iso_path]
@@ -727,12 +673,10 @@ class VirshTUI:
             self.info_lines = out.strip().split("\n")[:5]
             self.add_log(f"VM created: {name}")
         else:
-            # エラーの先頭行をステータスに表示（長すぎる場合は切り詰める）
-            err_first = out.strip().split("\n")[0] if out.strip() else "Unknown error"
-            self.status_msg = f"VM creation failed: {err_first[:60]}"
+            self.status_msg = f"VM creation failed for '{name}'"
             self.info_lines = out.strip().split("\n")[:8]
             self.add_log(f"VM creation failed: {name}")
-        self.refresh_vms(quiet=True)
+        self.refresh_vms()
 
     def do_delete_vm(self, vm):
         name = vm["name"]
@@ -770,9 +714,50 @@ class VirshTUI:
                 pass
 
     def edit_vm_menu(self, vm):
+        height, width = self.stdscr.getmaxyx()
+        state = vm["state"]
         items = ["Memory", "vCPUs", "Autostart", "Edit XML", "virt-manager", "Cancel"]
-        title = f" Edit: {vm['name'][:18]} "
-        return self._run_list_menu(title, items)
+        menu_w = 26
+        menu_h = len(items) + 2
+        menu_y = max(1, (height - menu_h) // 2)
+        menu_x = max(1, (width - menu_w) // 2)
+        selected = 0
+
+        while True:
+            for i, item in enumerate(items):
+                y = menu_y + 1 + i
+                x = menu_x + 2
+                if i == selected:
+                    self.stdscr.attron(curses.color_pair(8))
+                try:
+                    self.stdscr.addstr(y, x, f" {item:<{menu_w - 4}} ")
+                except curses.error:
+                    pass
+                if i == selected:
+                    self.stdscr.attroff(curses.color_pair(8))
+
+            try:
+                self.stdscr.attron(curses.A_REVERSE)
+                self.stdscr.addstr(menu_y, menu_x, " " * menu_w)
+                title = f" Edit: {vm['name'][:menu_w-8]} "
+                self.stdscr.addstr(menu_y, menu_x, title)
+                self.stdscr.attroff(curses.A_REVERSE)
+                self.stdscr.addstr(menu_y + menu_h - 1, menu_x, " " * menu_w)
+            except curses.error:
+                pass
+
+            self.stdscr.refresh()
+            key = self.stdscr.getch()
+            if key in (ord("j"), curses.KEY_DOWN):
+                selected = (selected + 1) % len(items)
+            elif key in (ord("k"), curses.KEY_UP):
+                selected = (selected - 1) % len(items)
+            elif key in (10, 13, curses.KEY_ENTER, ord(" ")):
+                return items[selected].lower().replace(" ", "-")
+            elif key in (27, ord("q"), ord("Q"), ord("c")):
+                self.clear_rect(menu_y, menu_x, menu_h, menu_w)
+                self.stdscr.refresh()
+                return "cancel"
 
     def edit_simple_value(self, title, current, is_num=False):
         height, width = self.stdscr.getmaxyx()
@@ -812,9 +797,8 @@ class VirshTUI:
 
             cx = form_x + 1 + len(disp)
             cy = form_y + 2
-            cx = min(cx, form_x + form_w - 2)
             try:
-                self.stdscr.move(cy, cx)
+                self.stdscr.move(cy, min(cx, form_x + form_w - 2))
             except curses.error:
                 pass
 
@@ -860,7 +844,7 @@ class VirshTUI:
                     if "Max memory" in line:
                         current = line.split(":")[-1].strip().split()[0]
 
-                current_mb = str(int(current) // 1024)
+                current_mb = str(int(int(current) / 1024))
                 new_mb = self.edit_simple_value("Memory (MB)", current_mb, is_num=True)
                 if new_mb is None or not new_mb:
                     continue
@@ -897,20 +881,8 @@ class VirshTUI:
                     self.add_log(msg)
 
             elif action == "autostart":
-                # 現在のautostart状態を取得
-                out, _ = run_virsh(["dominfo", name])
-                current_auto = "no"
-                for line in out.split("\n"):
-                    if "Autostart:" in line:
-                        current_auto = line.split(":")[-1].strip().lower()
-                        break
-                # トグル：現在がyesならdisable、noならenable
-                if current_auto == "yes":
-                    out, rc = run_virsh(["autostart", name, "--disable"])
-                    msg = f"Autostart disabled: {name} - {'OK' if rc == 0 else 'FAILED'}"
-                else:
-                    out, rc = run_virsh(["autostart", name])
-                    msg = f"Autostart enabled: {name} - {'OK' if rc == 0 else 'FAILED'}"
+                out, rc = run_virsh(["autostart", name])
+                msg = f"Autostart toggled: {name} - {'OK' if rc == 0 else 'FAILED'}"
                 self.add_log(msg)
 
             elif action == "edit-xml":
@@ -993,35 +965,71 @@ class VirshTUI:
                     self.do_delete_vm(vm)
                     continue
 
-                self.do_quick_action(vm, action, action.capitalize())
+                out, rc = vm_action(vm["name"], action)
+                if rc == 0:
+                    self.status_msg = f"{action.capitalize()}: {vm['name']} - OK"
+                    self.add_log(f"{action}: {vm['name']} - OK")
+                else:
+                    self.status_msg = f"{action.capitalize()}: {vm['name']} - FAILED"
+                    self.info_lines = out.strip().split("\n")[:5]
+                    self.add_log(f"{action}: {vm['name']} - FAILED")
+
+                time.sleep(0.5)
+                self.refresh_vms()
+                if self.vms and self.selected < len(self.vms):
+                    self.update_info(self.vms[self.selected])
 
             elif key == ord("s"):
                 if not self.vms:
                     continue
                 vm = self.vms[self.selected]
                 if vm["state"] == "shut off":
-                    self.do_quick_action(vm, "start", "Start")
+                    out, rc = vm_action(vm["name"], "start")
+                    self.status_msg = f"Start: {vm['name']} - {'OK' if rc == 0 else 'FAILED'}"
+                    self.add_log(self.status_msg)
+                    time.sleep(0.5)
+                    self.refresh_vms()
+                    if self.vms and self.selected < len(self.vms):
+                        self.update_info(self.vms[self.selected])
 
             elif key == ord("S"):
                 if not self.vms:
                     continue
                 vm = self.vms[self.selected]
                 if vm["state"] == "running":
-                    self.do_quick_action(vm, "shutdown", "Shutdown")
+                    out, rc = vm_action(vm["name"], "shutdown")
+                    self.status_msg = f"Shutdown: {vm['name']} - {'OK' if rc == 0 else 'FAILED'}"
+                    self.add_log(self.status_msg)
+                    time.sleep(0.5)
+                    self.refresh_vms()
+                    if self.vms and self.selected < len(self.vms):
+                        self.update_info(self.vms[self.selected])
 
             elif key == ord("f"):
                 if not self.vms:
                     continue
                 vm = self.vms[self.selected]
                 if vm["state"] in ("running", "paused"):
-                    self.do_quick_action(vm, "force-off", "ForceOff")
+                    out, rc = vm_action(vm["name"], "force-off")
+                    self.status_msg = f"ForceOff: {vm['name']} - {'OK' if rc == 0 else 'FAILED'}"
+                    self.add_log(self.status_msg)
+                    time.sleep(0.5)
+                    self.refresh_vms()
+                    if self.vms and self.selected < len(self.vms):
+                        self.update_info(self.vms[self.selected])
 
             elif key == ord("r"):
                 if not self.vms:
                     continue
                 vm = self.vms[self.selected]
                 if vm["state"] == "running":
-                    self.do_quick_action(vm, "reboot", "Reboot")
+                    out, rc = vm_action(vm["name"], "reboot")
+                    self.status_msg = f"Reboot: {vm['name']} - {'OK' if rc == 0 else 'FAILED'}"
+                    self.add_log(self.status_msg)
+                    time.sleep(0.5)
+                    self.refresh_vms()
+                    if self.vms and self.selected < len(self.vms):
+                        self.update_info(self.vms[self.selected])
 
             elif key == ord("e"):
                 if self.vms:
