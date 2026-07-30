@@ -244,7 +244,7 @@ class VirshTUI:
                 pass
 
     def draw_bottom_bar(self, height, width):
-        bar = " [↑↓/j/k]Nav [Enter]Menu [s]Start [S]Shutdown [f]ForceOff [r]Reboot [c]Create [v]VNC [C]Console [R]Refresh [q]Quit "
+        bar = " [↑↓/j/k]Nav [Enter]Menu [s]Start [S]Shutdown [f]ForceOff [r]Reboot [c]Create [e]Edit [D]Delete [v]Display [C]Console [R]Refresh [q]Quit "
         try:
             self.stdscr.attron(curses.color_pair(9))
             self.stdscr.addstr(height - 1, 0, bar[: width - 1].ljust(width))
@@ -277,6 +277,58 @@ class VirshTUI:
         self.draw_bottom_bar(height, width)
         self.stdscr.refresh()
 
+    def confirm_dialog(self, title, message):
+        height, width = self.stdscr.getmaxyx()
+        dialog_w = min(50, width - 4)
+        dialog_h = 6
+        dialog_y = max(1, (height - dialog_h) // 2)
+        dialog_x = max(1, (width - dialog_w) // 2)
+        selected = 0
+
+        while True:
+            for r in range(dialog_h):
+                try:
+                    self.stdscr.addstr(dialog_y + r, dialog_x, " " * dialog_w)
+                except curses.error:
+                    pass
+
+            self.stdscr.attron(curses.color_pair(7) | curses.A_REVERSE | curses.A_BOLD)
+            try:
+                self.stdscr.addstr(dialog_y, dialog_x, f" {title[:dialog_w-4]} ".ljust(dialog_w))
+            except curses.error:
+                pass
+            self.stdscr.attroff(curses.color_pair(7) | curses.A_REVERSE | curses.A_BOLD)
+
+            try:
+                self.stdscr.addstr(dialog_y + 2, dialog_x + 1, message[:dialog_w - 2])
+            except curses.error:
+                pass
+
+            for i, label in enumerate([" Yes ", " No "]):
+                x = dialog_x + dialog_w // 2 - 11 + i * 10
+                y = dialog_y + 4
+                if i == selected:
+                    self.stdscr.attron(curses.color_pair(8))
+                try:
+                    self.stdscr.addstr(y, x, label)
+                except curses.error:
+                    pass
+                if i == selected:
+                    self.stdscr.attroff(curses.color_pair(8))
+
+            self.stdscr.refresh()
+            key = self.stdscr.getch()
+            if key in (ord("j"), curses.KEY_DOWN, ord("\t"), curses.KEY_RIGHT):
+                selected = (selected + 1) % 2
+            elif key in (ord("k"), curses.KEY_UP, curses.KEY_BTAB, curses.KEY_LEFT):
+                selected = (selected - 1) % 2
+            elif key in (10, 13, curses.KEY_ENTER, ord(" ")):
+                self.clear_rect(dialog_y, dialog_x, dialog_h, dialog_w)
+                return selected == 0
+            elif key == 27:
+                self.clear_rect(dialog_y, dialog_x, dialog_h, dialog_w)
+                return False
+
     def show_menu(self, vm):
         height, width = self.stdscr.getmaxyx()
         state = vm["state"]
@@ -290,7 +342,7 @@ class VirshTUI:
             items = ["Start", "Info"]
         else:
             items = ["Info"]
-        items.append("Cancel")
+        items += ["Edit", "Delete", "Cancel"]
 
         menu_w = 26
         menu_h = len(items) + 2
@@ -304,10 +356,12 @@ class VirshTUI:
                 x = menu_x + 2
                 if i == selected:
                     self.stdscr.attron(curses.color_pair(8))
+                try:
                     self.stdscr.addstr(y, x, f" {item:<{menu_w - 4}} ")
+                except curses.error:
+                    pass
+                if i == selected:
                     self.stdscr.attroff(curses.color_pair(8))
-                else:
-                    self.stdscr.addstr(y, x, f" {item:<{menu_w - 4}} ")
 
             try:
                 self.stdscr.attron(curses.A_REVERSE)
@@ -326,8 +380,10 @@ class VirshTUI:
             elif key in (ord("k"), curses.KEY_UP):
                 selected = (selected - 1) % len(items)
             elif key in (10, 13, curses.KEY_ENTER, ord(" ")):
+                self.clear_rect(menu_y, menu_x, menu_h, menu_w)
                 return items[selected].lower().replace(" ", "-")
             elif key in (27, ord("q"), ord("Q"), ord("c")):
+                self.clear_rect(menu_y, menu_x, menu_h, menu_w)
                 return "cancel"
 
     def refresh_vms(self):
@@ -381,16 +437,17 @@ class VirshTUI:
     def create_vm_form(self):
         height, width = self.stdscr.getmaxyx()
         form_w = min(60, width - 4)
-        form_y = max(0, (height - 16) // 2)
+        form_y = max(0, (height - 18) // 2)
         form_x = max(0, (width - form_w) // 2)
 
         fields = [
-            ("Name:", "vm-name", "any"),
+            ("Name:", "test-vm", "any"),
             ("Memory (MB):", "2048", "num"),
             ("vCPUs:", "2", "num"),
             ("Disk Size (GB):", "20", "num"),
             ("ISO Path:", "/var/lib/libvirt/images/install.iso", "any"),
             ("Network:", "default", "any"),
+            ("Graphics:", "spice", "any"),
         ]
         n_flds = len(fields)
         total_elems = n_flds + 2
@@ -548,18 +605,23 @@ class VirshTUI:
         disk_size = values[3].strip()
         iso_path = values[4].strip()
         network = values[5].strip()
+        graphics = values[6].strip().lower()
 
         if not name:
             self.status_msg = "VM name is required"
             return
 
+        if graphics not in ("vnc", "spice"):
+            graphics = "spice"
+
+        gfx = f"{graphics},listen=0.0.0.0"
         args = [
             "--name", name,
             "--memory", memory,
             "--vcpus", vcpus,
             "--disk", f"size={disk_size}",
             "--network", network,
-            "--graphics", "vnc,listen=0.0.0.0",
+            "--graphics", gfx,
             "--noautoconsole",
             "--os-variant", "detect=on,require=off",
         ]
@@ -579,8 +641,231 @@ class VirshTUI:
         else:
             self.status_msg = f"VM creation failed for '{name}'"
             self.info_lines = out.strip().split("\n")[:8]
-
         self.refresh_vms()
+
+    def do_delete_vm(self, vm):
+        name = vm["name"]
+        state = vm["state"]
+
+        if not self.confirm_dialog("Delete VM", f"Delete '{name}' and its storage?"):
+            self.status_msg = "Delete cancelled"
+            return
+
+        self.status_msg = f"Deleting '{name}'..."
+        self.info_lines = [f"Removing VM: {name}"]
+        self.draw()
+
+        if state == "running":
+            run_virsh(["destroy", name])
+
+        out, rc = run_virsh(["undefine", name, "--remove-all-storage"])
+        self.refresh_vms()
+        if rc == 0:
+            self.status_msg = f"VM '{name}' deleted"
+            self.info_lines = out.strip().split("\n")[:3]
+        else:
+            self.status_msg = f"Failed to delete '{name}'"
+            self.info_lines = out.strip().split("\n")[:5]
+
+    def clear_rect(self, y, x, h, w):
+        for r in range(h):
+            try:
+                self.stdscr.addstr(y + r, x, " " * w)
+            except curses.error:
+                pass
+
+    def edit_vm_menu(self, vm):
+        height, width = self.stdscr.getmaxyx()
+        state = vm["state"]
+        items = ["Memory", "vCPUs", "Autostart", "Edit XML", "virt-manager", "Cancel"]
+        menu_w = 26
+        menu_h = len(items) + 2
+        menu_y = max(1, (height - menu_h) // 2)
+        menu_x = max(1, (width - menu_w) // 2)
+        selected = 0
+
+        while True:
+            for i, item in enumerate(items):
+                y = menu_y + 1 + i
+                x = menu_x + 2
+                if i == selected:
+                    self.stdscr.attron(curses.color_pair(8))
+                try:
+                    self.stdscr.addstr(y, x, f" {item:<{menu_w - 4}} ")
+                except curses.error:
+                    pass
+                if i == selected:
+                    self.stdscr.attroff(curses.color_pair(8))
+
+            try:
+                self.stdscr.attron(curses.A_REVERSE)
+                self.stdscr.addstr(menu_y, menu_x, " " * menu_w)
+                title = f" Edit: {vm['name'][:menu_w-8]} "
+                self.stdscr.addstr(menu_y, menu_x, title)
+                self.stdscr.attroff(curses.A_REVERSE)
+                self.stdscr.addstr(menu_y + menu_h - 1, menu_x, " " * menu_w)
+            except curses.error:
+                pass
+
+            self.stdscr.refresh()
+            key = self.stdscr.getch()
+            if key in (ord("j"), curses.KEY_DOWN):
+                selected = (selected + 1) % len(items)
+            elif key in (ord("k"), curses.KEY_UP):
+                selected = (selected - 1) % len(items)
+            elif key in (10, 13, curses.KEY_ENTER, ord(" ")):
+                return items[selected].lower().replace(" ", "-")
+            elif key in (27, ord("q"), ord("Q"), ord("c")):
+                self.clear_rect(menu_y, menu_x, menu_h, menu_w)
+                self.stdscr.refresh()
+                return "cancel"
+
+    def edit_simple_value(self, title, current, is_num=False):
+        height, width = self.stdscr.getmaxyx()
+        form_w = min(40, width - 4)
+        form_h = 6
+        form_y = max(1, (height - form_h) // 2)
+        form_x = max(1, (width - form_w) // 2)
+
+        val = current
+        editing = True
+        curses.curs_set(1)
+
+        while editing:
+            for r in range(form_h):
+                try:
+                    self.stdscr.addstr(form_y + r, form_x, " " * form_w)
+                except curses.error:
+                    pass
+
+            self.stdscr.attron(curses.color_pair(7) | curses.A_REVERSE | curses.A_BOLD)
+            try:
+                self.stdscr.addstr(form_y, form_x, f" {title[:form_w-4]} ".ljust(form_w))
+            except curses.error:
+                pass
+            self.stdscr.attroff(curses.color_pair(7) | curses.A_REVERSE | curses.A_BOLD)
+
+            disp = f"Value: {val}"
+            try:
+                self.stdscr.addstr(form_y + 2, form_x + 1, disp)
+            except curses.error:
+                pass
+            hint = " Enter: confirm  Esc: cancel "
+            try:
+                self.stdscr.addstr(form_y + 4, form_x + 1, hint[:form_w - 2])
+            except curses.error:
+                pass
+
+            cx = form_x + 1 + len(disp)
+            cy = form_y + 2
+            try:
+                self.stdscr.move(cy, min(cx, form_x + form_w - 2))
+            except curses.error:
+                pass
+
+            self.stdscr.refresh()
+            key = self.stdscr.getch()
+
+            if key in (10, 13, curses.KEY_ENTER):
+                editing = False
+            elif key == 27:
+                curses.curs_set(0)
+                return None
+            elif key in (curses.KEY_BACKSPACE, 127):
+                if val:
+                    val = val[:-1]
+            elif 32 <= key <= 126:
+                ch = chr(key)
+                if (not is_num or ch.isdigit()) and len(val) < 20:
+                    val += ch
+
+        for r in range(form_h):
+            try:
+                self.stdscr.addstr(form_y + r, form_x, " " * form_w)
+            except curses.error:
+                pass
+        self.stdscr.refresh()
+        curses.curs_set(0)
+        return val
+
+    def do_edit_vm(self, vm):
+        name = vm["name"]
+        while True:
+            action = self.edit_vm_menu(vm)
+
+            if action == "cancel":
+                self.status_msg = ""
+                return
+
+            msg = ""
+            if action == "memory":
+                out, _ = run_virsh(["dominfo", name])
+                current = "2097152"
+                for line in out.split("\n"):
+                    if "Max memory" in line:
+                        current = line.split(":")[-1].strip().split()[0]
+
+                current_mb = str(int(int(current) / 1024))
+                new_mb = self.edit_simple_value("Memory (MB)", current_mb, is_num=True)
+                if new_mb is None or not new_mb:
+                    continue
+                if new_mb == current_mb:
+                    msg = "Memory: unchanged"
+                else:
+                    new_kib = str(int(new_mb) * 1024)
+                    if vm["state"] == "running":
+                        out1, rc1 = run_virsh(["setmem", name, f"{new_mb}M"])
+                        out2, rc2 = run_virsh(["setmem", name, f"{new_kib}", "--config"])
+                        rc = rc1 if rc1 == 0 else rc2
+                    else:
+                        out, rc = run_virsh(["setmaxmem", name, f"{new_kib}", "--config"])
+                    msg = f"Memory: {name} - {'OK' if rc == 0 else 'FAILED'}"
+
+            elif action == "vcpus":
+                out, _ = run_virsh(["dominfo", name])
+                current = "2"
+                for line in out.split("\n"):
+                    if "CPU(s)" in line:
+                        current = line.split(":")[-1].strip()
+
+                new = self.edit_simple_value("vCPUs count", current, is_num=True)
+                if new is None or not new:
+                    continue
+                if new == current:
+                    msg = "vCPUs: unchanged"
+                else:
+                    out, rc = run_virsh(["setvcpus", name, new, "--config"])
+                    if rc == 0 and vm["state"] == "running":
+                        run_virsh(["setvcpus", name, new])
+                    msg = f"vCPUs: {name} - {'OK' if rc == 0 else 'FAILED'}"
+
+            elif action == "autostart":
+                out, rc = run_virsh(["autostart", name])
+                msg = f"Autostart toggled: {name} - {'OK' if rc == 0 else 'FAILED'}"
+
+            elif action == "edit-xml":
+                curses.def_prog_mode()
+                curses.endwin()
+                subprocess.run(["virsh", "edit", name])
+                curses.reset_prog_mode()
+                curses.doupdate()
+                msg = f"XML edit ended for '{name}'"
+
+            elif action == "virt-manager":
+                curses.def_prog_mode()
+                curses.endwin()
+                subprocess.run(["virt-manager", "--connect", "qemu:///system", "--show-domain", name],
+                               timeout=10)
+                curses.reset_prog_mode()
+                curses.doupdate()
+                msg = ""
+
+            self.refresh_vms()
+            if msg:
+                self.status_msg = msg
+            if self.vms and self.selected < len(self.vms):
+                self.update_info(self.vms[self.selected])
+
 
     def run(self):
         self.refresh_vms()
@@ -611,6 +896,7 @@ class VirshTUI:
 
                 vm = self.vms[self.selected]
                 action = self.show_menu(vm)
+                self.stdscr.clear()
 
                 if action == "cancel":
                     self.status_msg = ""
@@ -628,6 +914,14 @@ class VirshTUI:
 
                 if action == "console":
                     self.console_session(vm["name"])
+                    continue
+
+                if action == "edit":
+                    self.do_edit_vm(vm)
+                    continue
+
+                if action == "delete":
+                    self.do_delete_vm(vm)
                     continue
 
                 out, rc = vm_action(vm["name"], action)
@@ -689,6 +983,14 @@ class VirshTUI:
                     self.refresh_vms()
                     if self.vms and self.selected < len(self.vms):
                         self.update_info(self.vms[self.selected])
+
+            elif key == ord("e"):
+                if self.vms:
+                    self.do_edit_vm(self.vms[self.selected])
+
+            elif key == ord("D"):
+                if self.vms:
+                    self.do_delete_vm(self.vms[self.selected])
 
             elif key == ord("i"):
                 if self.vms:
