@@ -1,0 +1,729 @@
+#!/usr/bin/env python3
+
+import curses
+import subprocess
+import shlex
+import time
+import sys
+import os
+
+
+def run_virsh(args):
+    cmd = ["virsh"] + args
+    try:
+        result = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=15
+        )
+        return result.stdout + result.stderr, result.returncode
+    except subprocess.TimeoutExpired:
+        return "Command timed out", -1
+    except FileNotFoundError:
+        return "virsh not found. Install libvirt.", -1
+    except Exception as e:
+        return f"Error: {e}", -1
+
+
+def run_tool(tool, args, pkgs=None, timeout=60):
+    try:
+        result = subprocess.run(
+            [tool] + args, capture_output=True, text=True, timeout=timeout
+        )
+        return result.stdout + result.stderr, result.returncode
+    except FileNotFoundError:
+        if pkgs:
+            quoted = " ".join(shlex.quote(a) for a in args)
+            cmd = ["nix-shell", "-p"] + pkgs + ["--run", f"{tool} {quoted}"]
+            try:
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+                return result.stdout + result.stderr, result.returncode
+            except Exception as e:
+                return f"Error: {e}", -1
+        return f"tool not found", -1
+    except Exception as e:
+        return f"Error: {e}", -1
+
+
+def get_vms():
+    out, rc = run_virsh(["list", "--all"])
+    if rc != 0:
+        return []
+    vms = []
+    lines = out.strip().split("\n")
+    found_sep = False
+    for line in lines:
+        line = line.strip()
+        if line.startswith("---"):
+            found_sep = True
+            continue
+        if not found_sep or not line:
+            continue
+        parts = line.split(maxsplit=1)
+        if len(parts) < 2:
+            continue
+        vid = parts[0]
+        rest = parts[1]
+
+        if rest.endswith("shut off"):
+            name = rest[: -len("shut off")].rstrip()
+            state = "shut off"
+        elif rest.endswith("in shutdown"):
+            name = rest[: -len("in shutdown")].rstrip()
+            state = "in shutdown"
+        elif rest.endswith("running"):
+            name = rest[: -len("running")].rstrip()
+            state = "running"
+        elif rest.endswith("paused"):
+            name = rest[: -len("paused")].rstrip()
+            state = "paused"
+        elif rest.endswith("crashed"):
+            name = rest[: -len("crashed")].rstrip()
+            state = "crashed"
+        elif rest.endswith("dying"):
+            name = rest[: -len("dying")].rstrip()
+            state = "dying"
+        elif rest.endswith("pmsuspended"):
+            name = rest[: -len("pmsuspended")].rstrip()
+            state = "pmsuspended"
+        else:
+            name = rest
+            state = "unknown"
+
+        vms.append({"id": vid, "name": name, "state": state})
+    return vms
+
+
+def get_vm_info(name):
+    out, rc = run_virsh(["dominfo", name])
+    if rc != 0:
+        out2, _ = run_virsh(["domstate", name])
+        return f"Error getting info for {name}\n{out}{out2}"
+    return out
+
+
+def get_display_uri(name):
+    out, rc = run_virsh(["domdisplay", name])
+    if rc != 0 or not out.strip():
+        return None
+    return out.strip()
+
+
+def get_network_info(name):
+    out, rc = run_virsh(["domifaddr", name, "--source", "lease"])
+    if rc != 0 or not out.strip():
+        out, rc = run_virsh(["domifaddr", name])
+    if rc != 0 or not out.strip():
+        return "No IP info"
+    return out.strip()
+
+
+def vm_action(name, action):
+    cmd_map = {
+        "start": ["start"],
+        "shutdown": ["shutdown"],
+        "force-off": ["destroy"],
+        "reboot": ["reboot"],
+        "suspend": ["suspend"],
+        "resume": ["resume"],
+        "autostart": ["autostart"],
+        "no-autostart": ["autostart", "--disable"],
+    }
+    cmd = cmd_map.get(action, ["start"])
+    out, rc = run_virsh(cmd + [name])
+    return out, rc
+
+
+STATE_COLORS = {
+    "running": 1,
+    "shut off": 2,
+    "paused": 3,
+    "in shutdown": 4,
+    "crashed": 5,
+    "dying": 5,
+    "pmsuspended": 4,
+    "unknown": 6,
+}
+
+
+def quote_args(args):
+    return " ".join(shlex.quote(a) for a in args)
+
+
+class VirshTUI:
+    def __init__(self, stdscr):
+        self.stdscr = stdscr
+        self.vms = []
+        self.selected = 0
+        self.info_lines = ["QEMU/KVM Manager - Select a VM and press Enter for actions"]
+        self.status_msg = ""
+        self.running = True
+        self.last_refresh = 0
+
+        curses.curs_set(0)
+        curses.use_default_colors()
+        self.init_colors()
+
+    def init_colors(self):
+        curses.init_pair(1, curses.COLOR_GREEN, -1)
+        curses.init_pair(2, curses.COLOR_RED, -1)
+        curses.init_pair(3, curses.COLOR_YELLOW, -1)
+        curses.init_pair(4, curses.COLOR_MAGENTA, -1)
+        curses.init_pair(5, curses.COLOR_RED, -1)
+        curses.init_pair(6, curses.COLOR_WHITE, -1)
+        curses.init_pair(7, curses.COLOR_CYAN, -1)
+        curses.init_pair(8, curses.COLOR_WHITE, curses.COLOR_BLUE)
+        curses.init_pair(9, curses.COLOR_BLACK, curses.COLOR_CYAN)
+        curses.init_pair(10, curses.COLOR_GREEN, curses.COLOR_BLACK)
+
+    def get_list_rect(self, height, width):
+        list_top = 1
+        list_height = height - 8
+        return list_top, list_height
+
+    def draw_list(self, height, width):
+        list_top, list_height = self.get_list_rect(height, width)
+        col_w = max(width - 20, 30)
+
+        self.stdscr.attron(curses.color_pair(7) | curses.A_BOLD)
+        header = f"{'Name':<{col_w-18}} {'State':<12}"
+        try:
+            self.stdscr.addstr(list_top, 1, header[: width - 2])
+            self.stdscr.addstr(list_top, len(header) + 1, "ID")
+        except curses.error:
+            pass
+        self.stdscr.attroff(curses.color_pair(7) | curses.A_BOLD)
+
+        for i, vm in enumerate(self.vms):
+            if i >= list_height - 1:
+                break
+            name = vm["name"]
+            state = vm["state"]
+            vid = vm["id"]
+            if len(name) > col_w - 20:
+                name = name[: col_w - 23] + "..."
+            line = f"{name:<{col_w-18}} {state:<12}"
+            y = list_top + 1 + i
+            if i == self.selected:
+                self.stdscr.attron(curses.color_pair(8))
+                pad = " " * (width - 2)
+                try:
+                    self.stdscr.addstr(y, 1, pad[: width - 2])
+                    self.stdscr.addstr(y, 1, line[: width - 5])
+                    self.stdscr.addstr(y, width - 4, vid)
+                except curses.error:
+                    pass
+                self.stdscr.attroff(curses.color_pair(8))
+            else:
+                color = curses.color_pair(STATE_COLORS.get(state, 6))
+                self.stdscr.attron(color)
+                try:
+                    self.stdscr.addstr(y, 1, line[: width - 5])
+                    self.stdscr.addstr(y, width - 4, vid)
+                except curses.error:
+                    pass
+                self.stdscr.attroff(color)
+
+    def draw_info(self, height, width):
+        info_y = height - 6
+        try:
+            self.stdscr.addstr(info_y - 1, 0, "─" * width)
+        except curses.error:
+            pass
+        max_lines = 5
+        lines = self.info_lines[:max_lines]
+        for i, line in enumerate(lines):
+            try:
+                self.stdscr.addstr(info_y + i, 1, str(line)[: width - 3])
+            except curses.error:
+                pass
+        if self.status_msg:
+            try:
+                self.stdscr.attron(curses.color_pair(3))
+                self.stdscr.addstr(info_y + max_lines, 1, str(self.status_msg)[: width - 3])
+                self.stdscr.attroff(curses.color_pair(3))
+            except curses.error:
+                pass
+
+    def draw_bottom_bar(self, height, width):
+        bar = " [↑↓/j/k]Nav [Enter]Menu [s]Start [S]Shutdown [f]ForceOff [r]Reboot [c]Create [v]VNC [C]Console [R]Refresh [q]Quit "
+        try:
+            self.stdscr.attron(curses.color_pair(9))
+            self.stdscr.addstr(height - 1, 0, bar[: width - 1].ljust(width))
+            self.stdscr.attroff(curses.color_pair(9))
+        except curses.error:
+            pass
+
+    def draw_header(self, width):
+        header = " QEMU/KVM Manager "
+        try:
+            self.stdscr.attron(curses.color_pair(7) | curses.A_REVERSE | curses.A_BOLD)
+            self.stdscr.addstr(0, 0, header)
+            self.stdscr.addstr(0, len(header), " " * (width - len(header)))
+            self.stdscr.attroff(curses.color_pair(7) | curses.A_REVERSE | curses.A_BOLD)
+        except curses.error:
+            pass
+
+    def draw(self):
+        self.stdscr.nodelay(False)
+        height, width = self.stdscr.getmaxyx()
+        if height < 12 or width < 50:
+            self.stdscr.clear()
+            self.stdscr.addstr(0, 0, f"Terminal too small ({height}x{width}). Need at least 50x12.")
+            self.stdscr.refresh()
+            return
+        curses.curs_set(0)
+        self.draw_header(width)
+        self.draw_list(height, width)
+        self.draw_info(height, width)
+        self.draw_bottom_bar(height, width)
+        self.stdscr.refresh()
+
+    def show_menu(self, vm):
+        height, width = self.stdscr.getmaxyx()
+        state = vm["state"]
+
+        items = []
+        if state == "running":
+            items = ["Shutdown", "Force Off", "Reboot", "Suspend", "Console", "VNC Info", "Info"]
+        elif state == "paused":
+            items = ["Resume", "Force Off", "Console", "VNC Info", "Info"]
+        elif state == "shut off":
+            items = ["Start", "Info"]
+        else:
+            items = ["Info"]
+        items.append("Cancel")
+
+        menu_w = 26
+        menu_h = len(items) + 2
+        menu_y = max(1, (height - menu_h) // 2)
+        menu_x = max(1, (width - menu_w) // 2)
+        selected = 0
+
+        while True:
+            for i, item in enumerate(items):
+                y = menu_y + 1 + i
+                x = menu_x + 2
+                if i == selected:
+                    self.stdscr.attron(curses.color_pair(8))
+                    self.stdscr.addstr(y, x, f" {item:<{menu_w - 4}} ")
+                    self.stdscr.attroff(curses.color_pair(8))
+                else:
+                    self.stdscr.addstr(y, x, f" {item:<{menu_w - 4}} ")
+
+            try:
+                self.stdscr.attron(curses.A_REVERSE)
+                self.stdscr.addstr(menu_y, menu_x, " " * menu_w)
+                title = f" {vm['name'][:menu_w-4]} "
+                self.stdscr.addstr(menu_y, menu_x, title)
+                self.stdscr.attroff(curses.A_REVERSE)
+                self.stdscr.addstr(menu_y + menu_h - 1, menu_x, " " * menu_w)
+            except curses.error:
+                pass
+
+            self.stdscr.refresh()
+            key = self.stdscr.getch()
+            if key in (ord("j"), curses.KEY_DOWN):
+                selected = (selected + 1) % len(items)
+            elif key in (ord("k"), curses.KEY_UP):
+                selected = (selected - 1) % len(items)
+            elif key in (10, 13, curses.KEY_ENTER, ord(" ")):
+                return items[selected].lower().replace(" ", "-")
+            elif key in (27, ord("q"), ord("Q"), ord("c")):
+                return "cancel"
+
+    def refresh_vms(self):
+        self.vms = get_vms()
+        if self.vms:
+            self.selected = min(self.selected, len(self.vms) - 1)
+        else:
+            self.selected = 0
+            self.info_lines = ["No VMs found."]
+        self.status_msg = f"Refreshed: {len(self.vms)} VM(s)"
+
+    def update_info(self, vm):
+        out, _ = run_virsh(["dominfo", vm["name"]])
+        self.info_lines = out.strip().split("\n") if out.strip() else ["(no info)"]
+
+    def show_display_info(self, vm):
+        state = vm["state"]
+        lines = [f"Display info for: {vm['name']}", f"State: {state}"]
+        if state == "running":
+            uri = get_display_uri(vm["name"])
+            if uri:
+                lines.append(f"Display URI: {uri}")
+            else:
+                lines.append("Display: not available (no VNC/SPICE graphics)")
+            ip = get_network_info(vm["name"])
+            lines.append(f"Network:")
+            for l in ip.split("\n"):
+                lines.append(f"  {l}")
+        self.info_lines = lines
+
+    def console_session(self, name):
+        self.status_msg = f"Opening console for {name}... (Ctrl+] to exit)"
+        self.draw()
+        curses.def_prog_mode()
+        curses.endwin()
+        try:
+            subprocess.run(["virsh", "console", name])
+        except FileNotFoundError:
+            subprocess.run(
+                ["nix-shell", "-p", "libvirt", "--run", f"virsh console {shlex.quote(name)}"]
+            )
+        except Exception as e:
+            pass
+        curses.reset_prog_mode()
+        curses.doupdate()
+        self.status_msg = f"Console session ended"
+        self.refresh_vms()
+        if self.vms and self.selected < len(self.vms):
+            self.update_info(self.vms[self.selected])
+
+    def create_vm_form(self):
+        height, width = self.stdscr.getmaxyx()
+        form_w = min(60, width - 4)
+        form_y = max(0, (height - 16) // 2)
+        form_x = max(0, (width - form_w) // 2)
+
+        fields = [
+            ("Name:", "vm-name", "any"),
+            ("Memory (MB):", "2048", "num"),
+            ("vCPUs:", "2", "num"),
+            ("Disk Size (GB):", "20", "num"),
+            ("ISO Path:", "/var/lib/libvirt/images/install.iso", "any"),
+            ("Network:", "default", "any"),
+        ]
+        n_flds = len(fields)
+        total_elems = n_flds + 2
+
+        values = [f[1] for f in fields]
+        focus = 0
+        editing = False
+
+        while True:
+            self.stdscr.attron(curses.color_pair(7) | curses.A_REVERSE | curses.A_BOLD)
+            title = " Create Virtual Machine "
+            try:
+                self.stdscr.addstr(form_y, form_x, " " * form_w)
+                self.stdscr.addstr(form_y, form_x, title)
+            except curses.error:
+                pass
+            self.stdscr.attroff(curses.color_pair(7) | curses.A_REVERSE | curses.A_BOLD)
+
+            label_w = 14
+            val_w = form_w - label_w - 5
+
+            for i in range(n_flds):
+                y = form_y + 2 + i
+                label = fields[i][0]
+                val = values[i]
+
+                self.stdscr.attron(curses.A_BOLD)
+                try:
+                    self.stdscr.addstr(y, form_x + 1, f"{label:<{label_w}}")
+                except curses.error:
+                    pass
+                self.stdscr.attroff(curses.A_BOLD)
+
+                disp = val[:val_w]
+                pad = " " * (val_w - len(disp))
+
+                if i == focus and editing:
+                    self.stdscr.attron(curses.color_pair(8))
+                    try:
+                        self.stdscr.addstr(y, form_x + 2 + label_w, f" {disp}{pad} ")
+                    except curses.error:
+                        pass
+                    self.stdscr.attroff(curses.color_pair(8))
+                elif i == focus:
+                    self.stdscr.attron(curses.color_pair(8))
+                    try:
+                        self.stdscr.addstr(y, form_x + 2 + label_w, f" {disp}{pad} ")
+                    except curses.error:
+                        pass
+                    self.stdscr.attroff(curses.color_pair(8))
+                else:
+                    try:
+                        self.stdscr.addstr(y, form_x + 2 + label_w, f" {disp}{pad} ")
+                    except curses.error:
+                        pass
+
+            btn_y = form_y + 2 + n_flds + 1
+
+            if focus == n_flds:
+                self.stdscr.attron(curses.color_pair(10) | curses.A_REVERSE)
+            else:
+                self.stdscr.attron(curses.color_pair(10))
+            try:
+                self.stdscr.addstr(btn_y, form_x + 5, " Create ")
+            except curses.error:
+                pass
+            if focus == n_flds:
+                self.stdscr.attroff(curses.color_pair(10) | curses.A_REVERSE)
+            else:
+                self.stdscr.attroff(curses.color_pair(10))
+
+            if focus == n_flds + 1:
+                self.stdscr.attron(curses.color_pair(9))
+            else:
+                self.stdscr.attron(curses.color_pair(6))
+            try:
+                self.stdscr.addstr(btn_y, form_x + form_w - 13, " Cancel ")
+            except curses.error:
+                pass
+            if focus == n_flds + 1:
+                self.stdscr.attroff(curses.color_pair(9))
+            else:
+                self.stdscr.attroff(curses.color_pair(6))
+
+            help_y = btn_y + 2
+            if editing:
+                hint = " [editing] Enter: confirm  Esc: cancel edit  Tab/arrows: confirm & move "
+            else:
+                hint = " Tab/arrows: move  Enter: edit field / press button  Esc: cancel "
+            try:
+                self.stdscr.addstr(help_y, form_x + 1, hint[:form_w - 2])
+            except curses.error:
+                pass
+
+            if editing and focus < n_flds:
+                cx = form_x + 3 + label_w + len(values[focus][:val_w])
+                cy = form_y + 2 + focus
+                try:
+                    self.stdscr.move(cy, cx)
+                    curses.curs_set(1)
+                except curses.error:
+                    pass
+            else:
+                curses.curs_set(0)
+
+            self.stdscr.refresh()
+
+            key = self.stdscr.getch()
+
+            if editing and focus < n_flds:
+                if key in (10, 13, curses.KEY_ENTER):
+                    editing = False
+                    focus = (focus + 1) % total_elems
+                elif key == 27:
+                    editing = False
+                elif key in (ord("\t"), curses.KEY_DOWN):
+                    editing = False
+                    focus = (focus + 1) % total_elems
+                elif key in (curses.KEY_UP, curses.KEY_BTAB):
+                    editing = False
+                    focus = (focus - 1) % total_elems
+                elif key == curses.KEY_BACKSPACE or key == 127:
+                    if values[focus]:
+                        values[focus] = values[focus][:-1]
+                elif 32 <= key <= 126:
+                    ch = chr(key)
+                    is_num = fields[focus][2] == "num"
+                    if (not is_num or ch.isdigit()) and len(values[focus]) < val_w:
+                        values[focus] += ch
+            else:
+                if key in (ord("j"), curses.KEY_DOWN, ord("\t")):
+                    focus = (focus + 1) % total_elems
+                elif key in (ord("k"), curses.KEY_UP, curses.KEY_BTAB):
+                    focus = (focus - 1) % total_elems
+                elif key in (10, 13, curses.KEY_ENTER, ord(" ")):
+                    if focus == n_flds:
+                        self.stdscr.clear()
+                        return values
+                    elif focus == n_flds + 1:
+                        self.stdscr.clear()
+                        return None
+                    else:
+                        editing = True
+                elif key == 27:
+                    self.stdscr.clear()
+                    return None
+
+    def do_create_vm(self, values):
+        if not values:
+            return
+
+        name = values[0].strip()
+        memory = values[1].strip()
+        vcpus = values[2].strip()
+        disk_size = values[3].strip()
+        iso_path = values[4].strip()
+        network = values[5].strip()
+
+        if not name:
+            self.status_msg = "VM name is required"
+            return
+
+        args = [
+            "--name", name,
+            "--memory", memory,
+            "--vcpus", vcpus,
+            "--disk", f"size={disk_size}",
+            "--network", network,
+            "--graphics", "vnc,listen=0.0.0.0",
+            "--noautoconsole",
+            "--os-variant", "detect=on,require=off",
+        ]
+        if iso_path:
+            args += ["--cdrom", iso_path]
+        else:
+            args += ["--location", "http://archive.ubuntu.com/ubuntu/dists/noble/main/installer-amd64/"]
+
+        self.status_msg = f"Creating VM '{name}'..."
+        self.info_lines = [f"Running: virt-install {' '.join(args[:6])}..."]
+        self.draw()
+
+        out, rc = run_tool("virt-install", args, pkgs=["virt-manager"], timeout=120)
+        if rc == 0:
+            self.status_msg = f"VM '{name}' created successfully"
+            self.info_lines = out.strip().split("\n")[:5]
+        else:
+            self.status_msg = f"VM creation failed for '{name}'"
+            self.info_lines = out.strip().split("\n")[:8]
+
+        self.refresh_vms()
+
+    def run(self):
+        self.refresh_vms()
+        if self.vms:
+            self.update_info(self.vms[0])
+
+        while self.running:
+            self.draw()
+
+            key = self.stdscr.getch()
+
+            if key in (ord("q"), ord("Q")):
+                self.running = False
+
+            elif key in (ord("j"), curses.KEY_DOWN):
+                if self.vms:
+                    self.selected = min(self.selected + 1, len(self.vms) - 1)
+                    self.update_info(self.vms[self.selected])
+
+            elif key in (ord("k"), curses.KEY_UP):
+                if self.vms:
+                    self.selected = max(self.selected - 1, 0)
+                    self.update_info(self.vms[self.selected])
+
+            elif key in (10, 13, curses.KEY_ENTER):
+                if not self.vms:
+                    continue
+
+                vm = self.vms[self.selected]
+                action = self.show_menu(vm)
+
+                if action == "cancel":
+                    self.status_msg = ""
+                    continue
+
+                if action == "info":
+                    self.update_info(vm)
+                    self.status_msg = ""
+                    continue
+
+                if action == "vnc-info":
+                    self.show_display_info(vm)
+                    self.status_msg = ""
+                    continue
+
+                if action == "console":
+                    self.console_session(vm["name"])
+                    continue
+
+                out, rc = vm_action(vm["name"], action)
+                if rc == 0:
+                    self.status_msg = f"{action.capitalize()}: {vm['name']} - OK"
+                else:
+                    self.status_msg = f"{action.capitalize()}: {vm['name']} - FAILED"
+                    self.info_lines = out.strip().split("\n")[:5]
+
+                time.sleep(0.5)
+                self.refresh_vms()
+                if self.vms and self.selected < len(self.vms):
+                    self.update_info(self.vms[self.selected])
+
+            elif key == ord("s"):
+                if not self.vms:
+                    continue
+                vm = self.vms[self.selected]
+                if vm["state"] == "shut off":
+                    out, rc = vm_action(vm["name"], "start")
+                    self.status_msg = f"Start: {vm['name']} - {'OK' if rc == 0 else 'FAILED'}"
+                    time.sleep(0.5)
+                    self.refresh_vms()
+                    if self.vms and self.selected < len(self.vms):
+                        self.update_info(self.vms[self.selected])
+
+            elif key == ord("S"):
+                if not self.vms:
+                    continue
+                vm = self.vms[self.selected]
+                if vm["state"] == "running":
+                    out, rc = vm_action(vm["name"], "shutdown")
+                    self.status_msg = f"Shutdown: {vm['name']} - {'OK' if rc == 0 else 'FAILED'}"
+                    time.sleep(0.5)
+                    self.refresh_vms()
+                    if self.vms and self.selected < len(self.vms):
+                        self.update_info(self.vms[self.selected])
+
+            elif key == ord("f"):
+                if not self.vms:
+                    continue
+                vm = self.vms[self.selected]
+                if vm["state"] in ("running", "paused"):
+                    out, rc = vm_action(vm["name"], "force-off")
+                    self.status_msg = f"ForceOff: {vm['name']} - {'OK' if rc == 0 else 'FAILED'}"
+                    time.sleep(0.5)
+                    self.refresh_vms()
+                    if self.vms and self.selected < len(self.vms):
+                        self.update_info(self.vms[self.selected])
+
+            elif key == ord("r"):
+                if not self.vms:
+                    continue
+                vm = self.vms[self.selected]
+                if vm["state"] == "running":
+                    out, rc = vm_action(vm["name"], "reboot")
+                    self.status_msg = f"Reboot: {vm['name']} - {'OK' if rc == 0 else 'FAILED'}"
+                    time.sleep(0.5)
+                    self.refresh_vms()
+                    if self.vms and self.selected < len(self.vms):
+                        self.update_info(self.vms[self.selected])
+
+            elif key == ord("i"):
+                if self.vms:
+                    self.update_info(self.vms[self.selected])
+                    self.status_msg = ""
+
+            elif key == ord("c"):
+                vals = self.create_vm_form()
+                if vals:
+                    self.do_create_vm(vals)
+
+            elif key == ord("v"):
+                if self.vms:
+                    self.show_display_info(self.vms[self.selected])
+                    self.status_msg = ""
+
+            elif key == ord("C"):
+                if self.vms:
+                    vm = self.vms[self.selected]
+                    if vm["state"] == "running":
+                        self.console_session(vm["name"])
+
+            elif key == ord("R"):
+                self.refresh_vms()
+                if self.vms and self.selected < len(self.vms):
+                    self.update_info(self.vms[self.selected])
+
+
+def main(stdscr):
+    app = VirshTUI(stdscr)
+    try:
+        app.run()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    curses.wrapper(main)
